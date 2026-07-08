@@ -2,7 +2,7 @@
 
 Educational SQLi scanner for the Syntecxhub Cybersecurity Internship — **Project 1**.
 
-## ⚠️ Legal / Ethical Use
+## Legal / Ethical Use
 
 Only run this against systems you own or are explicitly authorized to test —
 e.g. a **local DVWA** instance, or another intentionally-vulnerable practice
